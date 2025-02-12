@@ -187,7 +187,7 @@ class EncoderLayer(nn.Module):
         # Dropout for regularization
         self.dropout = nn.Dropout(dropout)
     
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, return_attention=False):
         """
         Args:
             x: Input tensor (batch_size, seq_len, d_model)
@@ -198,21 +198,17 @@ class EncoderLayer(nn.Module):
             Output tensor of same shape
         """
         # Self attention block
-        # 1. Layer Norm
         norm_x = self.norm1(x)
-        # 2. Multi-head attention
-        attn_output, _ = self.self_attention(norm_x, norm_x, norm_x, mask)
-        # 3. Residual connection and dropout
+        attn_output, attention_weights = self.self_attention(norm_x, norm_x, norm_x, mask)
         x = x + self.dropout(attn_output)
         
         # Feed forward block
-        # 1. Layer Norm
         norm_x = self.norm2(x)
-        # 2. Feed forward
         ff_output = self.feed_forward(norm_x)
-        # 3. Residual connection and dropout
         x = x + self.dropout(ff_output)
         
+        if return_attention:
+            return x, attention_weights
         return x 
 
 class PositionalEncoding(nn.Module):
@@ -270,23 +266,32 @@ class Encoder(nn.Module):
         # Dropout for regularization
         self.dropout = nn.Dropout(dropout)
         
-    def forward(self, x, mask=None):
+    def forward(self, x, mask=None, return_attention=False):
         """
         Args:
             x: Input tensor (batch_size, seq_len, d_model)
-                e.g., (32, 196, 512) for image patches
             mask: Optional attention mask
+            return_attention: Whether to return attention weights
         
         Returns:
-            Output tensor of same shape after all encoder layers
+            output: Tensor of shape (batch_size, seq_len, d_model)
+            attention_weights: Optional, attention weights from all layers
         """
+        attention_weights = []
+        
         # Add positional encoding
         x = self.positional_encoding(x)
         x = self.dropout(x)
         
         # Process through each encoder layer
         for layer in self.layers:
-            x = layer(x, mask)
+            x, attn = layer(x, mask, return_attention=return_attention)
+            if return_attention:
+                attention_weights.append(attn)
         
         # Final layer normalization
-        return self.norm(x) 
+        x = self.norm(x)
+        
+        if return_attention:
+            return x, attention_weights
+        return x 
