@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from Background1 import *  # Import our constants
+import math
 
 class ScaledDotProductAttention(nn.Module):
     """
@@ -107,3 +108,185 @@ class MultiHeadAttention(nn.Module):
         output = self.W_o(output)  # Final linear projection
         
         return output, attention_weights 
+
+class PositionWiseFeedForward(nn.Module):
+    """
+    Position-wise Feed-Forward Network.
+    Applies two linear transformations with a ReLU activation in between.
+    FFN(x) = max(0, xW₁ + b₁)W₂ + b₂
+    """
+    def __init__(self, d_model=D_MODEL, d_ff=2048):
+        super().__init__()
+        self.linear1 = nn.Linear(d_model, d_ff)   # First linear layer (512 -> 2048)
+        self.linear2 = nn.Linear(d_ff, d_model)   # Second linear layer (2048 -> 512)
+        self.relu = nn.ReLU()                     # ReLU activation between layers
+        
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor (batch_size, seq_len, d_model)
+                e.g., (32, 196, 512) for image patches
+        
+        Returns:
+            Output tensor of same shape (batch_size, seq_len, d_model)
+        """
+        # First linear layer + ReLU
+        x = self.relu(self.linear1(x))  # (batch_size, seq_len, d_ff)
+        
+        # Second linear layer
+        x = self.linear2(x)             # (batch_size, seq_len, d_model)
+        
+        return x 
+
+class LayerNorm(nn.Module):
+    """
+    Layer Normalization.
+    Normalizes the inputs across the features for stability.
+    """
+    def __init__(self, d_model=D_MODEL, eps=1e-12):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(d_model))  # Learnable scale parameter
+        self.beta = nn.Parameter(torch.zeros(d_model))  # Learnable bias parameter
+        self.eps = eps  # Small constant for numerical stability
+    
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor (batch_size, seq_len, d_model)
+                e.g., (32, 196, 512) for image patches
+        
+        Returns:
+            Normalized tensor of same shape
+        """
+        # Calculate mean and variance along last dimension
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, unbiased=False, keepdim=True)
+        
+        # Normalize
+        x_norm = (x - mean) / torch.sqrt(var + self.eps)
+        
+        # Scale and shift with learnable parameters
+        return self.gamma * x_norm + self.beta 
+
+class EncoderLayer(nn.Module):
+    """
+    Single layer of the encoder.
+    Consists of Multi-Head Attention followed by Feed-Forward Network,
+    with Layer Normalization and residual connections.
+    """
+    def __init__(self, d_model=D_MODEL, num_heads=N_HEADS, d_ff=2048, dropout=0.1):
+        super().__init__()
+        # Main components
+        self.self_attention = MultiHeadAttention(d_model, num_heads)
+        self.feed_forward = PositionWiseFeedForward(d_model, d_ff)
+        
+        # Layer normalization
+        self.norm1 = LayerNorm(d_model)
+        self.norm2 = LayerNorm(d_model)
+        
+        # Dropout for regularization
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: Input tensor (batch_size, seq_len, d_model)
+                e.g., (32, 196, 512) for image patches
+            mask: Optional attention mask
+        
+        Returns:
+            Output tensor of same shape
+        """
+        # Self attention block
+        # 1. Layer Norm
+        norm_x = self.norm1(x)
+        # 2. Multi-head attention
+        attn_output, _ = self.self_attention(norm_x, norm_x, norm_x, mask)
+        # 3. Residual connection and dropout
+        x = x + self.dropout(attn_output)
+        
+        # Feed forward block
+        # 1. Layer Norm
+        norm_x = self.norm2(x)
+        # 2. Feed forward
+        ff_output = self.feed_forward(norm_x)
+        # 3. Residual connection and dropout
+        x = x + self.dropout(ff_output)
+        
+        return x 
+
+class PositionalEncoding(nn.Module):
+    """
+    Adds positional information to input embeddings.
+    Uses fixed sinusoidal encodings from the original transformer paper.
+    """
+    def __init__(self, d_model=D_MODEL, max_seq_length=5000):
+        super().__init__()
+        
+        # Create positional encoding matrix
+        pe = torch.zeros(max_seq_length, d_model)
+        position = torch.arange(0, max_seq_length, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        
+        # Apply sine to even indices
+        pe[:, 0::2] = torch.sin(position * div_term)
+        # Apply cosine to odd indices
+        pe[:, 1::2] = torch.cos(position * div_term)
+        
+        # Add batch dimension and register as buffer (won't be trained)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+        
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor (batch_size, seq_len, d_model)
+        Returns:
+            Output tensor with added positional encodings
+        """
+        return x + self.pe[:, :x.size(1)]
+
+class Encoder(nn.Module):
+    """
+    Complete Encoder with multiple layers.
+    Processes input sequence through multiple encoder layers with positional encoding.
+    """
+    def __init__(self, num_layers=6, d_model=D_MODEL, num_heads=N_HEADS, 
+                 d_ff=2048, dropout=0.1, max_seq_length=5000):
+        super().__init__()
+        
+        # Positional encoding layer
+        self.positional_encoding = PositionalEncoding(d_model, max_seq_length)
+        
+        # Stack of encoder layers
+        self.layers = nn.ModuleList([
+            EncoderLayer(d_model, num_heads, d_ff, dropout)
+            for _ in range(num_layers)
+        ])
+        
+        # Final layer normalization
+        self.norm = LayerNorm(d_model)
+        
+        # Dropout for regularization
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: Input tensor (batch_size, seq_len, d_model)
+                e.g., (32, 196, 512) for image patches
+            mask: Optional attention mask
+        
+        Returns:
+            Output tensor of same shape after all encoder layers
+        """
+        # Add positional encoding
+        x = self.positional_encoding(x)
+        x = self.dropout(x)
+        
+        # Process through each encoder layer
+        for layer in self.layers:
+            x = layer(x, mask)
+        
+        # Final layer normalization
+        return self.norm(x) 
