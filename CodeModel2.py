@@ -295,3 +295,153 @@ class Encoder(nn.Module):
         if return_attention:
             return x, attention_weights
         return x 
+
+class DecoderLayer(nn.Module):
+    """
+    Single layer of the decoder.
+    Contains three sub-layers:
+    1. Masked Multi-Head Self-Attention
+    2. Multi-Head Cross-Attention with Encoder output
+    3. Position-wise Feed-Forward Network
+    """
+    def __init__(self, d_model=D_MODEL, num_heads=N_HEADS, d_ff=2048, dropout=0.1):
+        super().__init__()
+        
+        # Main components
+        self.self_attention = MultiHeadAttention(d_model, num_heads)
+        self.cross_attention = MultiHeadAttention(d_model, num_heads)
+        self.feed_forward = PositionWiseFeedForward(d_model, d_ff)
+        
+        # Layer normalization
+        self.norm1 = LayerNorm(d_model)
+        self.norm2 = LayerNorm(d_model)
+        self.norm3 = LayerNorm(d_model)
+        
+        # Dropout for regularization
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, encoder_output, src_mask=None, tgt_mask=None):
+        """
+        Args:
+            x: Target sequence (batch_size, target_seq_len, d_model)
+            encoder_output: Output from encoder (batch_size, source_seq_len, d_model)
+            src_mask: Mask for encoder output
+            tgt_mask: Mask for target sequence (prevents attending to future tokens)
+        
+        Returns:
+            Output tensor of shape (batch_size, target_seq_len, d_model)
+        """
+        # 1. Masked Self-Attention
+        # First normalization
+        norm_x = self.norm1(x)
+        # Apply masked self-attention
+        attn_output, _ = self.self_attention(norm_x, norm_x, norm_x, tgt_mask)
+        # Residual connection and dropout
+        x = x + self.dropout(attn_output)
+        
+        # 2. Cross-Attention with Encoder output
+        # Second normalization
+        norm_x = self.norm2(x)
+        # Apply cross-attention
+        cross_attn_output, _ = self.cross_attention(
+            norm_x,                  # Query from decoder
+            encoder_output,          # Key from encoder
+            encoder_output,          # Value from encoder
+            src_mask                 # Mask for encoder output
+        )
+        # Residual connection and dropout
+        x = x + self.dropout(cross_attn_output)
+        
+        # 3. Feed Forward
+        # Third normalization
+        norm_x = self.norm3(x)
+        # Apply feed forward
+        ff_output = self.feed_forward(norm_x)
+        # Final residual connection and dropout
+        x = x + self.dropout(ff_output)
+        
+        return x
+
+class Decoder(nn.Module):
+    """
+    Complete Decoder with multiple layers.
+    Processes target sequence using multiple decoder layers with positional encoding.
+    """
+    def __init__(self, num_layers=6, d_model=D_MODEL, num_heads=N_HEADS,
+                 d_ff=2048, dropout=0.1, max_seq_length=5000):
+        super().__init__()
+        
+        # Positional encoding layer
+        self.positional_encoding = PositionalEncoding(d_model, max_seq_length)
+        
+        # Stack of decoder layers
+        self.layers = nn.ModuleList([
+            DecoderLayer(d_model, num_heads, d_ff, dropout)
+            for _ in range(num_layers)
+        ])
+        
+        # Final layer normalization
+        self.norm = LayerNorm(d_model)
+        
+        # Dropout for regularization
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x, encoder_output, src_mask=None, tgt_mask=None):
+        """
+        Args:
+            x: Target sequence (batch_size, target_seq_len, d_model)
+            encoder_output: Output from encoder (batch_size, source_seq_len, d_model)
+            src_mask: Mask for encoder output
+            tgt_mask: Mask for target sequence (prevents attending to future tokens)
+        
+        Returns:
+            Output tensor of shape (batch_size, target_seq_len, d_model)
+        """
+        # Add positional encoding
+        x = self.positional_encoding(x)
+        x = self.dropout(x)
+        
+        # Process through each decoder layer
+        for layer in self.layers:
+            x = layer(x, encoder_output, src_mask, tgt_mask)
+        
+        # Final layer normalization
+        return self.norm(x)
+
+class Transformer(nn.Module):
+    """
+    Complete Transformer model for image captioning.
+    Combines Encoder, Decoder, and final prediction layers.
+    """
+    def __init__(self, vocab_size, d_model=D_MODEL, num_heads=N_HEADS,
+                 num_encoder_layers=6, num_decoder_layers=6,
+                 d_ff=2048, dropout=0.1, max_seq_length=5000):
+        super().__init__()
+        
+        # Main components
+        self.encoder = Encoder(num_encoder_layers, d_model, num_heads, d_ff, dropout)
+        self.decoder = Decoder(num_decoder_layers, d_model, num_heads, d_ff, dropout)
+        
+        # Final linear layer for prediction
+        self.linear = nn.Linear(d_model, vocab_size)
+        
+    def forward(self, src, tgt, src_mask=None, tgt_mask=None):
+        """
+        Args:
+            src: Source sequence (image features)
+            tgt: Target sequence (partial caption)
+            src_mask: Mask for source sequence
+            tgt_mask: Mask for target sequence
+        
+        Returns:
+            Output probabilities over vocabulary
+        """
+        # Encode source sequence
+        encoder_output = self.encoder(src, src_mask)
+        
+        # Decode with encoder output
+        decoder_output = self.decoder(tgt, encoder_output, src_mask, tgt_mask)
+        
+        # Project to vocabulary size and apply softmax
+        output = self.linear(decoder_output)
+        return F.log_softmax(output, dim=-1)
