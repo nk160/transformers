@@ -1,0 +1,25 @@
+# Deep Learning Framework
+torch>=1.9.0
+torchvision>=0.10.0
+
+# NLP Tools
+nltk>=3.6.0
+pycocoevalcap>=1.2
+
+# Data Processing
+pillow>=8.3.0
+numpy>=1.19.0
+datasets>=1.11.0
+
+# Logging and Visualization
+wandb>=0.12.0
+matplotlib>=3.4.0
+seaborn>=0.11.0
+tqdm>=4.62.0
+
+# Configuration
+pyyaml>=5.4.0
+
+# Optional: CUDA support
+# Install appropriate version based on your CUDA version
+# torch-cuda>=11.1 
