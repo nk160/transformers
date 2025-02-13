@@ -9,6 +9,7 @@ from typing import List, Union
 import torch.nn.functional as F
 from datasets import load_dataset
 from torch.utils.data import Dataset, DataLoader
+from tokenizer import CaptionTokenizer
 
 class ImagePreprocessor:
     """Handles image preprocessing including resizing and patching."""
@@ -142,7 +143,7 @@ class ImagePreprocessor:
 class Flickr30kDataset(Dataset):
     """Dataset class for Flickr30k"""
     
-    def __init__(self, split='train'):
+    def __init__(self, split='train', max_length=50):
         """
         Initialize the dataset.
         Args:
@@ -151,22 +152,76 @@ class Flickr30kDataset(Dataset):
         # Load dataset from HuggingFace
         self.dataset = load_dataset("nlphuji/flickr30k", split=split)
         self.image_processor = ImagePreprocessor()
+        self.max_length = max_length
+        
+        # Initialize tokenizer
+        self.tokenizer = CaptionTokenizer()
+        
+        # Build vocabulary from training captions
+        if split == 'train':
+            self._build_vocabulary()
+        else:
+            # Load vocabulary for val/test
+            self.tokenizer = CaptionTokenizer.from_file('vocab.json')
+    
+    def _build_vocabulary(self):
+        """
+        Build vocabulary from training captions.
+        """
+        # Collect all captions
+        all_captions = []
+        for item in self.dataset:
+            all_captions.extend(item['caption'])
+        
+        # Preprocess captions
+        processed_captions = [
+            self.tokenizer.preprocess_caption(caption)
+            for caption in all_captions
+        ]
+        
+        # Build vocabulary
+        self.tokenizer.build_vocab(processed_captions)
+        
+        # Save vocabulary
+        self.tokenizer.save_vocab('vocab.json')
+        
+        # Print vocabulary statistics
+        stats = self.tokenizer.analyze_vocabulary()
+        print(f"Vocabulary Statistics:")
+        print(f"Total vocabulary size: {stats['total_vocab_size']}")
+        print(f"Total words: {stats['total_words']}")
+        print(f"Vocabulary coverage: {stats['coverage']:.2%}")
+        
+        # Plot distributions
+        self.tokenizer.plot_word_frequency_distribution()
+        self.tokenizer.plot_word_length_distribution()
     
     def __len__(self):
         return len(self.dataset)
     
     def __getitem__(self, idx):
-        # Get image and captions
         item = self.dataset[idx]
         image = item['image']
-        captions = item['caption']  # List of 5 captions
+        captions = item['caption']
         
         # Process image
         processed_image = self.image_processor.process_image(image)
         
+        # Process captions
+        processed_captions = [
+            self.tokenizer.preprocess_caption(caption)
+            for caption in captions
+        ]
+        
+        # Encode captions
+        encoded_captions = self.tokenizer.encode_batch(
+            processed_captions,
+            max_length=self.max_length
+        )
+        
         return {
             'image_embeddings': processed_image,
-            'captions': captions
+            'captions': encoded_captions
         }
 
 def create_dataloaders(batch_size=32, num_workers=4):
