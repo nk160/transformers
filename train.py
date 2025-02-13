@@ -17,13 +17,17 @@ from nltk.translate.bleu_score import sentence_bleu
 from nltk.translate.meteor_score import meteor_score
 import nltk
 nltk.download('wordnet')  # Required for METEOR score
+from pycocoevalcap.cider.cider import Cider
+from pycocoevalcap.spice.spice import Spice
+from collections import defaultdict
+from utils.config import load_config
 
 class TransformerTrainer:
     """
     Handles the training process for the Transformer model.
     Includes training loop, optimization, and logging.
     """
-    def __init__(self, model, vocab_size, learning_rate=0.0001, device='cuda'):
+    def __init__(self, model, vocab_size, learning_rate=0.0001, device='cuda', config=None):
         self.model = model.to(device)
         self.device = device
         self.optimizer = Adam(model.parameters(), lr=learning_rate)
@@ -34,6 +38,8 @@ class TransformerTrainer:
         self.train_losses = []
         self.val_losses = []
         self.current_epoch = 0
+        
+        self.config = config
         
     def create_masks(self, src, tgt):
         """
@@ -67,8 +73,8 @@ class TransformerTrainer:
                 "learning_rate": self.optimizer.param_groups[0]['lr'],
                 "architecture": "Transformer",
                 "dataset": "Flickr30k",
-                "epochs": self.num_epochs,
-                "batch_size": self.batch_size,
+                "epochs": self.config['training']['num_epochs'],
+                "batch_size": self.config['training']['batch_size'],
                 "device": self.device
             }
         )
@@ -148,7 +154,7 @@ class TransformerTrainer:
 
     def validate(self, val_loader):
         """
-        Validate the model with caption quality metrics.
+        Validate the model with comprehensive caption quality metrics.
         """
         self.model.eval()
         total_loss = 0
@@ -158,11 +164,21 @@ class TransformerTrainer:
         # Metrics tracking
         bleu_scores = []
         meteor_scores = []
+        cider_scores = []
+        spice_scores = []
+        
+        # Initialize scorers
+        cider_scorer = Cider()
+        spice_scorer = Spice()
+        
+        # For CIDEr and SPICE evaluation
+        all_gts = defaultdict(list)
+        all_res = defaultdict(list)
         
         with torch.no_grad():
             progress_bar = tqdm(val_loader, desc=f'Validation')
             
-            for batch in progress_bar:
+            for batch_idx, batch in enumerate(progress_bar):
                 # Get image features and captions
                 image_features = batch['image_embeddings'].to(self.device)
                 captions = batch['captions'].to(self.device)
@@ -193,41 +209,52 @@ class TransformerTrainer:
                     for cap in captions
                 ]
                 
-                # Update metrics
+                # Store for CIDEr and SPICE calculation
+                for i, (pred, target) in enumerate(zip(pred_captions, target_captions)):
+                    idx = batch_idx * batch.size(0) + i
+                    all_gts[idx] = [target]
+                    all_res[idx] = [pred]
+                
+                # Update other metrics
                 for pred, target in zip(pred_captions, target_captions):
-                    # BLEU score
                     bleu = sentence_bleu([target.split()], pred.split())
                     bleu_scores.append(bleu)
                     
-                    # METEOR score
                     meteor = meteor_score([target.split()], pred.split())
                     meteor_scores.append(meteor)
                 
                 progress_bar.set_postfix({
                     'val_loss': loss.item(),
-                    'bleu': np.mean(bleu_scores[-batch.size(0):]),
-                    'meteor': np.mean(meteor_scores[-batch.size(0):])
+                    'bleu': np.mean(bleu_scores[-batch.size(0):])
                 })
-        
-        # Calculate average metrics
-        avg_loss = total_loss / num_batches
-        avg_bleu = np.mean(bleu_scores)
-        avg_meteor = np.mean(meteor_scores)
-        
-        # Log metrics
-        wandb.log({
-            "val_loss": avg_loss,
-            "val_bleu": avg_bleu,
-            "val_meteor": avg_meteor
-        })
-        
-        logger.info(f"Validation Metrics:")
-        logger.info(f"Loss: {avg_loss:.4f}")
-        logger.info(f"BLEU: {avg_bleu:.4f}")
-        logger.info(f"METEOR: {avg_meteor:.4f}")
-        
-        return avg_loss
-    
+            
+            # Calculate CIDEr and SPICE scores
+            cider_score, _ = cider_scorer.compute_score(all_gts, all_res)
+            spice_score, spice_details = spice_scorer.compute_score(all_gts, all_res)
+            
+            # Calculate average metrics
+            avg_loss = total_loss / num_batches
+            avg_bleu = np.mean(bleu_scores)
+            avg_meteor = np.mean(meteor_scores)
+            
+            # Log metrics
+            wandb.log({
+                "val_loss": avg_loss,
+                "val_bleu": avg_bleu,
+                "val_meteor": avg_meteor,
+                "val_cider": float(cider_score),
+                "val_spice": float(spice_score)
+            })
+            
+            logger.info(f"Validation Metrics:")
+            logger.info(f"Loss: {avg_loss:.4f}")
+            logger.info(f"BLEU: {avg_bleu:.4f}")
+            logger.info(f"METEOR: {avg_meteor:.4f}")
+            logger.info(f"CIDEr: {cider_score:.4f}")
+            logger.info(f"SPICE: {spice_score:.4f}")
+            
+            return avg_loss
+
     def _get_predictions(self, output):
         """
         Convert model output to caption predictions.
@@ -337,19 +364,23 @@ def main():
     """
     Main function to set up and run the training process.
     """
+    # Load configuration
+    config = load_config('config.yaml')
+    
     try:
         # Set up logging
-        logger = setup_logging()
+        logger = setup_logging(config['logging']['log_dir'])
         logger.info("Starting training setup...")
         
         # Set device
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = torch.device(config['training']['device'] 
+                            if torch.cuda.is_available() else 'cpu')
         logger.info(f"Using device: {device}")
         
         # Create dataloaders
         try:
             logger.info("Creating dataloaders...")
-            dataloaders = create_dataloaders(batch_size=32, num_workers=4)
+            dataloaders = create_dataloaders(config)
             train_loader = dataloaders['train']
             val_loader = dataloaders['val']
             logger.info(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
@@ -360,14 +391,7 @@ def main():
         # Initialize model
         try:
             logger.info("Initializing model...")
-            vocab_size = 10000
-            model = Transformer(
-                vocab_size=vocab_size,
-                d_model=D_MODEL,
-                num_heads=N_HEADS,
-                num_encoder_layers=6,
-                num_decoder_layers=6
-            )
+            model = Transformer(config)
             logger.info("Model initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize model: {str(e)}")
@@ -378,9 +402,10 @@ def main():
             logger.info("Setting up trainer...")
             trainer = TransformerTrainer(
                 model=model,
-                vocab_size=vocab_size,
-                learning_rate=0.0001,
-                device=device
+                vocab_size=config['model']['vocab_size'],
+                learning_rate=config['training']['learning_rate'],
+                device=device,
+                config=config
             )
             logger.info("Trainer initialized successfully")
         except Exception as e:
@@ -393,8 +418,8 @@ def main():
             trainer.train(
                 train_loader=train_loader,
                 val_loader=val_loader,
-                num_epochs=30,
-                batch_size=32
+                num_epochs=config['training']['num_epochs'],
+                batch_size=config['training']['batch_size']
             )
             logger.info("Training completed successfully")
         except Exception as e:

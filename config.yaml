@@ -1,0 +1,39 @@
+# Model Architecture
+model:
+  vocab_size: 10000
+  d_model: 512
+  num_heads: 8
+  num_encoder_layers: 6
+  num_decoder_layers: 6
+  dim_feedforward: 2048
+  dropout: 0.1
+
+# Image Processing
+image:
+  img_size: 224
+  patch_size: 16
+  num_channels: 3
+
+# Training
+training:
+  batch_size: 32
+  num_epochs: 30
+  learning_rate: 0.0001
+  num_workers: 4
+  device: 'cuda'
+  max_length: 50
+  beam_size: 5
+
+# Logging
+logging:
+  project_name: "image-captioning-transformer"
+  log_dir: "logs"
+  save_dir: "checkpoints"
+  log_every_n_steps: 100
+
+# Data
+data:
+  dataset_name: "flickr30k"
+  train_split: "train"
+  val_split: "validation"
+  test_split: "test" 

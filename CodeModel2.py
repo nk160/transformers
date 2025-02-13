@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from Background1 import *  # Import our constants
 import math
+from utils.config import load_config
 
 class ScaledDotProductAttention(nn.Module):
     """
@@ -413,17 +414,38 @@ class Transformer(nn.Module):
     Complete Transformer model for image captioning.
     Combines Encoder, Decoder, and final prediction layers.
     """
-    def __init__(self, vocab_size, d_model=D_MODEL, num_heads=N_HEADS,
-                 num_encoder_layers=6, num_decoder_layers=6,
-                 d_ff=2048, dropout=0.1, max_seq_length=5000):
+    def __init__(self, config=None):
         super().__init__()
+        if config is None:
+            config = load_config('config.yaml')
         
-        # Main components
-        self.encoder = Encoder(num_encoder_layers, d_model, num_heads, d_ff, dropout)
-        self.decoder = Decoder(num_decoder_layers, d_model, num_heads, d_ff, dropout)
+        # Model parameters from config
+        self.vocab_size = config['model']['vocab_size']
+        self.d_model = config['model']['d_model']
+        self.num_heads = config['model']['num_heads']
+        self.num_encoder_layers = config['model']['num_encoder_layers']
+        self.num_decoder_layers = config['model']['num_decoder_layers']
+        self.dim_feedforward = config['model']['dim_feedforward']
+        self.dropout = config['model']['dropout']
         
-        # Final linear layer for prediction
-        self.linear = nn.Linear(d_model, vocab_size)
+        # Initialize components
+        self.encoder = Encoder(
+            num_layers=self.num_encoder_layers,
+            d_model=self.d_model,
+            num_heads=self.num_heads,
+            d_ff=self.dim_feedforward,
+            dropout=self.dropout
+        )
+        
+        self.decoder = Decoder(
+            num_layers=self.num_decoder_layers,
+            d_model=self.d_model,
+            num_heads=self.num_heads,
+            d_ff=self.dim_feedforward,
+            dropout=self.dropout
+        )
+        
+        self.linear = nn.Linear(self.d_model, self.vocab_size)
         
     def forward(self, src, tgt, src_mask=None, tgt_mask=None):
         """

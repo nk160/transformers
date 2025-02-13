@@ -7,25 +7,32 @@ from pathlib import Path
 from nltk.translate.bleu_score import sentence_bleu
 from nltk.translate.meteor_score import meteor_score
 import numpy as np
+from pycocoevalcap.cider.cider import Cider
+from pycocoevalcap.spice.spice import Spice
+from collections import defaultdict
 
 from CodeModel1 import ImagePreprocessor
 from CodeModel2 import Transformer
 from tokenizer import CaptionTokenizer
 from Background1 import *
+from utils.config import load_config
 
 class CaptionGenerator:
     """
     Handles image caption generation using the trained transformer model.
     """
-    def __init__(self, model_path: str, device: str = 'cuda'):
-        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+    def __init__(self, model_path: str, config_path: str = 'config.yaml', device: str = 'cuda'):
+        self.config = load_config(config_path)
+        self.device = torch.device(
+            self.config['training']['device'] if torch.cuda.is_available() else 'cpu'
+        )
         self.logger = self._setup_logging()
         
         # Load tokenizer
         self.tokenizer = CaptionTokenizer.from_file('vocab.json')
         
         # Initialize image processor
-        self.image_processor = ImagePreprocessor()
+        self.image_processor = ImagePreprocessor(self.config)
         
         # Load model
         self.model = self._load_model(model_path)
@@ -187,24 +194,52 @@ class CaptionGenerator:
 
     def evaluate_caption(self, generated_caption: str, reference_captions: List[str]) -> dict:
         """
-        Evaluate generated caption against reference captions.
+        Evaluate generated caption against reference captions using multiple metrics.
         """
-        # Calculate BLEU score
+        # Prepare captions in required format for CIDEr and SPICE
+        gts = defaultdict(list)
+        res = defaultdict(list)
+        
+        # Add reference and generated captions
+        gts[0] = reference_captions
+        res[0] = [generated_caption]
+        
+        # Initialize scorers
+        cider_scorer = Cider()
+        spice_scorer = Spice()
+        
+        # Calculate BLEU and METEOR scores (existing code)
         bleu1 = sentence_bleu([ref.split() for ref in reference_captions], 
                             generated_caption.split(), weights=(1, 0, 0, 0))
         bleu4 = sentence_bleu([ref.split() for ref in reference_captions], 
                             generated_caption.split(), weights=(0.25, 0.25, 0.25, 0.25))
-        
-        # Calculate METEOR score
         meteor = np.mean([
             meteor_score([ref.split()], generated_caption.split())
             for ref in reference_captions
         ])
         
+        # Calculate CIDEr score
+        cider_score, cider_scores = cider_scorer.compute_score(gts, res)
+        
+        # Calculate SPICE score
+        spice_score, spice_scores = spice_scorer.compute_score(gts, res)
+        
+        # Get detailed SPICE scores for different aspects
+        spice_details = spice_scores[0]  # Get details for first caption
+        
         return {
             'bleu1': bleu1,
             'bleu4': bleu4,
-            'meteor': meteor
+            'meteor': meteor,
+            'cider': float(cider_score),
+            'spice': float(spice_score),
+            'spice_details': {
+                'objects': spice_details['objects'],
+                'attributes': spice_details['attributes'],
+                'relations': spice_details['relations'],
+                'cardinality': spice_details['cardinality'],
+                'size': spice_details['size']
+            }
         }
     
     def visualize_generation_process(self, image: Image.Image, max_length: int = 50):

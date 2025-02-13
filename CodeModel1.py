@@ -10,25 +10,27 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from torch.utils.data import Dataset, DataLoader
 from tokenizer import CaptionTokenizer
+from utils.config import load_config
 
 class ImagePreprocessor:
     """Handles image preprocessing including resizing and patching."""
     
-    def __init__(self, img_size=IMG_SIZE, patch_size=PATCH_SIZE):
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.n_patches = (img_size // patch_size) ** 2
+    def __init__(self, config):
+        self.img_size = config['image']['img_size']
+        self.patch_size = config['image']['patch_size']
+        self.n_patches = (self.img_size // self.patch_size) ** 2
         
         # Define image transformation pipeline
         self.transform = transforms.Compose([
-            transforms.Resize((img_size, img_size)),
-            transforms.ToTensor(),  # Convert to tensor and normalize to [0, 1]
+            transforms.Resize((self.img_size, self.img_size)),
+            transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                              std=[0.229, 0.224, 0.225])  # ImageNet statistics
+                              std=[0.229, 0.224, 0.225])
         ])
         
         # Linear projection of flattened patches
-        self.patch_embedding = nn.Linear(PATCH_EMBEDDING_DIM, D_MODEL)
+        patch_dim = config['image']['num_channels'] * self.patch_size * self.patch_size
+        self.patch_embedding = nn.Linear(patch_dim, config['model']['d_model'])
 
     def extract_patches(self, image_tensor):
         """
@@ -143,22 +145,25 @@ class ImagePreprocessor:
 class Flickr30kDataset(Dataset):
     """Dataset class for Flickr30k"""
     
-    def __init__(self, split='train', max_length=50):
+    def __init__(self, split='train', config=None):
         """
         Initialize the dataset.
         Args:
             split: 'train', 'validation', or 'test'
         """
-        # Load dataset from HuggingFace
-        self.dataset = load_dataset("nlphuji/flickr30k", split=split)
-        self.image_processor = ImagePreprocessor()
-        self.max_length = max_length
+        self.config = config or load_config('config.yaml')
+        self.dataset = load_dataset(
+            self.config['data']['dataset_name'], 
+            split=split
+        )
+        self.image_processor = ImagePreprocessor(self.config)
+        self.max_length = self.config['training']['max_length']
         
         # Initialize tokenizer
-        self.tokenizer = CaptionTokenizer()
+        self.tokenizer = CaptionTokenizer(vocab_size=self.config['model']['vocab_size'])
         
         # Build vocabulary from training captions
-        if split == 'train':
+        if split == self.config['data']['train_split']:
             self._build_vocabulary()
         else:
             # Load vocabulary for val/test
@@ -224,44 +229,55 @@ class Flickr30kDataset(Dataset):
             'captions': encoded_captions
         }
 
-def create_dataloaders(batch_size=32, num_workers=4):
+def create_dataloaders(config=None):
     """
     Create DataLoaders for train, validation, and test sets.
     
     Args:
-        batch_size: Number of samples per batch
-        num_workers: Number of subprocesses for data loading
+        config: Configuration object
     
     Returns:
         dict: Dictionary containing train, val, and test dataloaders
     """
+    if config is None:
+        config = load_config('config.yaml')
+    
     # Create datasets for each split
-    train_dataset = Flickr30kDataset(split='train')
-    val_dataset = Flickr30kDataset(split='validation')
-    test_dataset = Flickr30kDataset(split='test')
+    train_dataset = Flickr30kDataset(
+        split=config['data']['train_split'],
+        config=config
+    )
+    val_dataset = Flickr30kDataset(
+        split=config['data']['val_split'],
+        config=config
+    )
+    test_dataset = Flickr30kDataset(
+        split=config['data']['test_split'],
+        config=config
+    )
     
     # Create dataloaders
     train_loader = DataLoader(
         train_dataset,
-        batch_size=batch_size,
+        batch_size=config['training']['batch_size'],
         shuffle=True,
-        num_workers=num_workers,
+        num_workers=config['training']['num_workers'],
         pin_memory=True
     )
     
     val_loader = DataLoader(
         val_dataset,
-        batch_size=batch_size,
+        batch_size=config['training']['batch_size'],
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=config['training']['num_workers'],
         pin_memory=True
     )
     
     test_loader = DataLoader(
         test_dataset,
-        batch_size=batch_size,
+        batch_size=config['training']['batch_size'],
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=config['training']['num_workers'],
         pin_memory=True
     )
     
@@ -274,7 +290,7 @@ def create_dataloaders(batch_size=32, num_workers=4):
 # Example usage:
 if __name__ == "__main__":
     # Create dataloaders
-    dataloaders = create_dataloaders(batch_size=32)
+    dataloaders = create_dataloaders()
     
     # Example: Iterate through one batch of training data
     for batch in dataloaders['train']:
