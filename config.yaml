@@ -33,7 +33,7 @@ logging:
 
 # Data
 data:
-  dataset_name: "flickr30k"
-  train_split: "train"
-  val_split: "validation"
+  dataset_name: "nlphuji/flickr30k"
+  train_split: "test"
+  val_split: "test"
   test_split: "test" 

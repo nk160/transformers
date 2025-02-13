@@ -123,11 +123,15 @@ class ImagePreprocessor:
         Input: PIL Image
         Output: Tensor of shape (n_patches, D_MODEL) = (196, 512)
         """
-        self.validate_image(image)
-        img_tensor = self.transform(image)
-        patches = self.extract_patches(img_tensor)
-        embeddings = self.patch_embedding(patches)
-        return embeddings
+        with torch.no_grad():
+            self.validate_image(image)
+            img_tensor = self.transform(image)
+            patches = self.extract_patches(img_tensor)
+            embeddings = self.patch_embedding(patches)
+            # Add batch dimension if not present
+            if embeddings.dim() == 2:
+                embeddings = embeddings.unsqueeze(0)
+            return embeddings.detach()
 
     def process_batch(self, images: List[Image.Image]) -> torch.Tensor:
         """
@@ -138,36 +142,42 @@ class ImagePreprocessor:
         self.validate_batch(images)
         batch_embeddings = []
         for img in images:
-            embeddings = self.process_image(img)
-            batch_embeddings.append(embeddings)
-        return torch.stack(batch_embeddings)
+            embeddings = self.process_image(img)  # Should be (1, n_patches, D_MODEL)
+            batch_embeddings.append(embeddings.squeeze(0))  # Remove the batch dimension before stacking
+        stacked = torch.stack(batch_embeddings, dim=0)  # Stack along batch dimension
+        print(f"Debug - Batch embeddings shape: {stacked.shape}")  # Should be (B, n_patches, D_MODEL)
+        return stacked
 
 class Flickr30kDataset(Dataset):
     """Dataset class for Flickr30k"""
     
     def __init__(self, split='train', config=None):
-        """
-        Initialize the dataset.
-        Args:
-            split: 'train', 'validation', or 'test'
-        """
+        """Initialize the dataset."""
         self.config = config or load_config('config.yaml')
+        print(f"Loading {split} split from {self.config['data']['dataset_name']}")
+        
+        # Load only a small subset for testing
         self.dataset = load_dataset(
-            self.config['data']['dataset_name'], 
-            split=split
+            self.config['data']['dataset_name'],
+            split=f"{split}[:1000]"  # Load only first 1000 examples
         )
+        print(f"Loaded {len(self.dataset)} examples")
+        
         self.image_processor = ImagePreprocessor(self.config)
         self.max_length = self.config['training']['max_length']
         
         # Initialize tokenizer
         self.tokenizer = CaptionTokenizer(vocab_size=self.config['model']['vocab_size'])
         
-        # Build vocabulary from training captions
         if split == self.config['data']['train_split']:
             self._build_vocabulary()
         else:
-            # Load vocabulary for val/test
-            self.tokenizer = CaptionTokenizer.from_file('vocab.json')
+            try:
+                self.tokenizer = CaptionTokenizer.from_file('vocab.json')
+                print("Loaded existing vocabulary")
+            except:
+                print("No vocabulary file found, building new vocabulary")
+                self._build_vocabulary()
     
     def _build_vocabulary(self):
         """
