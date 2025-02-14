@@ -11,6 +11,7 @@ from datasets import load_dataset
 from torch.utils.data import Dataset, DataLoader
 from tokenizer import CaptionTokenizer
 from utils.config import load_config
+import logging
 
 class ImagePreprocessor:
     """Handles image preprocessing including resizing and patching."""
@@ -161,85 +162,18 @@ class ImagePreprocessor:
 class Flickr30kDataset(Dataset):
     """Dataset class for Flickr30k"""
     
-    def __init__(self, split='train', config=None):
-        """Initialize the dataset."""
+    def __init__(self, dataset, tokenizer, config=None):
+        """Initialize the dataset.
+        Args:
+            dataset: HuggingFace dataset
+            tokenizer: CaptionTokenizer instance
+            config: Optional config dict
+        """
         self.config = config or load_config('config.yaml')
-        print(f"Loading {split} split from {self.config['data']['dataset_name']}")
-        
-        # First load the test split, then apply our split percentages
-        full_dataset = load_dataset(
-            self.config['data']['dataset_name'],
-            split="test"
-        )
-        
-        # Calculate indices for our splits (based on 1000 examples)
-        total_size = min(len(full_dataset), 1000)
-        if "test[:80%]" in split:
-            start_idx = 0
-            end_idx = int(0.8 * total_size)
-        elif "test[80%:90%]" in split:
-            start_idx = int(0.8 * total_size)
-            end_idx = int(0.9 * total_size)
-        else:  # test[90%:]
-            start_idx = int(0.9 * total_size)
-            end_idx = total_size
-        
-        # Select our portion
-        self.dataset = full_dataset.select(range(start_idx, end_idx))
-        print(f"Loaded {len(self.dataset)} examples")
-        
+        self.dataset = dataset
+        self.tokenizer = tokenizer
         self.image_processor = ImagePreprocessor(self.config)
         self.max_length = self.config['training']['max_length']
-        
-        # Initialize tokenizer
-        self.tokenizer = CaptionTokenizer(vocab_size=self.config['model']['vocab_size'])
-        
-        if "test[" not in split or split == "test[:80%]":  # Build vocab for training portion
-            self._build_vocabulary()
-        else:
-            try:
-                self.tokenizer = CaptionTokenizer.from_file('vocab.json')
-                print("Loaded existing vocabulary")
-            except:
-                print("No vocabulary file found, building new vocabulary")
-                self._build_vocabulary()
-    
-    def _build_vocabulary(self):
-        """
-        Build vocabulary from training captions.
-        """
-        # Collect all captions
-        all_captions = []
-        for item in self.dataset:
-            all_captions.extend(item['caption'])
-        
-        # Preprocess captions
-        processed_captions = [
-            self.tokenizer.preprocess_caption(caption)
-            for caption in all_captions
-        ]
-        
-        # Build vocabulary
-        self.tokenizer.build_vocab(processed_captions)
-        
-        # Save vocabulary
-        self.tokenizer.save_vocab('vocab.json')
-        
-        # Print vocabulary statistics
-        stats = self.tokenizer.analyze_vocabulary()
-        print(f"Vocabulary Statistics:")
-        print(f"Total vocabulary size: {stats['total_vocab_size']}")
-        print(f"Total words: {stats['total_words']}")
-        print(f"Vocabulary coverage: {stats['coverage']:.2%}")
-        
-        # Plot distributions
-        self.tokenizer.plot_word_frequency_distribution()
-        self.tokenizer.plot_word_length_distribution()
-        
-        # After building vocabulary, update config
-        actual_vocab_size = self.tokenizer.get_vocab_size()
-        self.config['model']['vocab_size'] = actual_vocab_size
-        print(f"Updated config vocab_size to {actual_vocab_size}")
     
     def __len__(self):
         return len(self.dataset)
@@ -269,56 +203,62 @@ class Flickr30kDataset(Dataset):
             'captions': encoded_captions
         }
 
-def create_dataloaders(config=None):
-    """
-    Create DataLoaders for train, validation, and test sets.
+def create_dataloaders(config):
+    """Create train, validation and test dataloaders"""
     
-    Args:
-        config: Configuration object
+    # Load full dataset from test split
+    full_dataset = load_dataset("nlphuji/flickr30k", split='test')
+    total_size = len(full_dataset)
     
-    Returns:
-        dict: Dictionary containing train, val, and test dataloaders
-    """
-    if config is None:
-        config = load_config('config.yaml')
+    # Calculate split sizes for proper partitioning
+    train_size = int(0.8 * total_size)  # 80% for training
+    val_size = int(0.1 * total_size)    # 10% for validation
     
-    # Create datasets for each split
-    train_dataset = Flickr30kDataset(
-        split="test[:80%]",  # Use first 80% for training
-        config=config
-    )
-    val_dataset = Flickr30kDataset(
-        split="test[80%:90%]",  # Use next 10% for validation
-        config=config
-    )
-    test_dataset = Flickr30kDataset(
-        split="test[90%:]",  # Use last 10% for testing
-        config=config
-    )
+    # Create splits using select
+    train_dataset = full_dataset.select(range(train_size))
+    val_dataset = full_dataset.select(range(train_size, train_size + val_size))
+    test_dataset = full_dataset.select(range(train_size + val_size, total_size))
+    
+    logger = logging.getLogger(__name__)
+    logger.info(f"Total dataset size: {total_size}")
+    logger.info(f"Loaded {len(train_dataset)} training examples")
+    logger.info(f"Loaded {len(val_dataset)} validation examples")
+    logger.info(f"Loaded {len(test_dataset)} test examples")
+    
+    # Create tokenizer and build vocabulary from training data only
+    tokenizer = CaptionTokenizer(config['model']['vocab_size'])
+    
+    # Flatten the list of caption lists into a single list of captions
+    train_captions = [
+        caption 
+        for item in train_dataset 
+        for caption in item['caption']
+    ]
+    logger.info(f"Total number of training captions: {len(train_captions)}")
+    
+    tokenizer.build_vocab(train_captions)
+    tokenizer.save_vocab('vocab.json')
     
     # Create dataloaders
     train_loader = DataLoader(
-        train_dataset,
+        Flickr30kDataset(train_dataset, tokenizer, config),
         batch_size=config['training']['batch_size'],
         shuffle=True,
-        num_workers=config['training']['num_workers'],
-        pin_memory=True
+        num_workers=config['training']['num_workers']
     )
     
     val_loader = DataLoader(
-        val_dataset,
+        Flickr30kDataset(val_dataset, tokenizer, config),
         batch_size=config['training']['batch_size'],
         shuffle=False,
-        num_workers=config['training']['num_workers'],
-        pin_memory=True
+        num_workers=config['training']['num_workers']
     )
     
     test_loader = DataLoader(
-        test_dataset,
+        Flickr30kDataset(test_dataset, tokenizer, config),
         batch_size=config['training']['batch_size'],
         shuffle=False,
-        num_workers=config['training']['num_workers'],
-        pin_memory=True
+        num_workers=config['training']['num_workers']
     )
     
     return {
