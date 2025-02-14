@@ -22,32 +22,64 @@ from pycocoevalcap.spice.spice import Spice
 from collections import defaultdict
 from utils.config import load_config
 
+class DropoutWrapper(nn.Module):
+    """Wrapper module that adds dropout to a model"""
+    def __init__(self, model, dropout_p=0.2):
+        super().__init__()
+        self.model = model
+        self.dropout = nn.Dropout(p=dropout_p)
+        # Copy important attributes from the model
+        self.vocab_size = model.vocab_size
+        
+    def forward(self, src, tgt, tgt_mask=None):
+        # Pass through model first
+        output = self.model(src=src, tgt=tgt, tgt_mask=tgt_mask)
+        # Apply dropout to output
+        return self.dropout(output)
+
 class TransformerTrainer:
     """
     Handles the training process for the Transformer model.
     Includes training loop, optimization, and logging.
     """
     def __init__(self, model, vocab_size, learning_rate=None, device='cuda', config=None):
+        """Initialize trainer with additional regularization"""
         self.config = config or load_config('config.yaml')
         self.device = torch.device(device)
-        self.model = model.to(self.device)
-        self.logger = logging.getLogger(__name__)  # Add logger initialization
+        
+        # Wrap model with dropout
+        self.model = DropoutWrapper(
+            model,
+            dropout_p=0.2
+        ).to(self.device)
+        
+        self.logger = logging.getLogger(__name__)
         
         # Use learning rate from config
         learning_rate = learning_rate or self.config['training']['learning_rate']
-        self.optimizer = Adam(model.parameters(), lr=learning_rate)
+        self.optimizer = Adam(self.model.parameters(), lr=learning_rate)
+        
+        # Add learning rate scheduler
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode='min',
+            patience=3,
+            factor=0.5,
+            verbose=True
+        )
         
         self.criterion = CrossEntropyLoss(ignore_index=0)  # ignore PAD token
         self.tokenizer = CaptionTokenizer.from_file('vocab.json')
         
         # Verify dimensions
-        assert self.tokenizer.get_vocab_size() == self.model.vocab_size, \
-            f"Tokenizer vocab size ({self.tokenizer.get_vocab_size()}) != Model vocab size ({self.model.vocab_size})"
+        assert self.tokenizer.get_vocab_size() == model.vocab_size, \
+            f"Tokenizer vocab size ({self.tokenizer.get_vocab_size()}) != Model vocab size ({model.vocab_size})"
         
         # Initialize tracking variables
         self.train_losses = []
         self.val_losses = []
         self.current_epoch = 0
+        self.best_val_loss = float('inf')
         
         # Initialize example indices for validation logging
         self.example_indices = list(range(min(5, vocab_size)))  # Log first 5 examples
@@ -238,7 +270,7 @@ class TransformerTrainer:
 
     def train(self, train_loader, val_loader, num_epochs, batch_size):
         """
-        Main training loop with error handling.
+        Main training loop with early stopping and learning rate scheduling.
         """
         try:
             self.num_epochs = num_epochs
@@ -248,6 +280,9 @@ class TransformerTrainer:
             # Setup W&B logging
             self.setup_wandb()
             
+            # Early stopping parameters
+            patience = 5
+            no_improve_count = 0
             best_val_loss = float('inf')
             
             for epoch in range(num_epochs):
@@ -263,22 +298,31 @@ class TransformerTrainer:
                     val_loss = self.validate(val_loader)
                     self.val_losses.append(val_loss)
                     
+                    # Learning rate scheduling
+                    self.scheduler.step(val_loss)
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                    
                     # Log metrics
                     wandb.log({
                         "epoch": epoch,
                         "train_loss": train_loss,
-                        "val_loss": val_loss
+                        "val_loss": val_loss,
+                        "learning_rate": current_lr
                     })
                     
-                    # Save best model
+                    # Early stopping and model saving logic
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
+                        no_improve_count = 0
+                        
+                        # Save best model
                         model_path = f'best_model_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pt'
                         try:
                             torch.save({
                                 'epoch': epoch,
                                 'model_state_dict': self.model.state_dict(),
                                 'optimizer_state_dict': self.optimizer.state_dict(),
+                                'scheduler_state_dict': self.scheduler.state_dict(),
                                 'train_losses': self.train_losses,
                                 'val_losses': self.val_losses,
                             }, model_path)
@@ -286,16 +330,24 @@ class TransformerTrainer:
                             logger.info(f"Saved best model with validation loss: {val_loss:.4f}")
                         except Exception as e:
                             logger.error(f"Failed to save model checkpoint: {str(e)}")
+                    else:
+                        no_improve_count += 1
+                    
+                    # Early stopping check
+                    if no_improve_count >= patience:
+                        logger.info(f"Early stopping triggered after {epoch+1} epochs")
+                        break
                     
                     logger.info(f'Epoch {epoch+1}/{num_epochs}:')
                     logger.info(f'Training Loss: {train_loss:.4f}')
                     logger.info(f'Validation Loss: {val_loss:.4f}')
+                    logger.info(f'Learning Rate: {current_lr:.6f}')
                     logger.info('-' * 50)
                     
                 except Exception as e:
                     logger.error(f"Error in epoch {epoch+1}: {str(e)}")
                     raise
-                
+            
         except Exception as e:
             logger.error(f"Training failed: {str(e)}")
             raise
