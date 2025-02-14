@@ -27,41 +27,50 @@ class TransformerTrainer:
     Handles the training process for the Transformer model.
     Includes training loop, optimization, and logging.
     """
-    def __init__(self, model, vocab_size, learning_rate=0.0001, device='cuda', config=None):
-        self.model = model.to(device)
-        self.device = device
-        self.optimizer = Adam(model.parameters(), lr=learning_rate)
-        self.criterion = CrossEntropyLoss(ignore_index=0)  # ignore PAD token (0)
-        self.tokenizer = CaptionTokenizer.from_file('vocab.json')  # Load saved vocabulary
+    def __init__(self, model, vocab_size, learning_rate=None, device='cuda', config=None):
+        self.config = config or load_config('config.yaml')
+        self.device = torch.device(device)
+        self.model = model.to(self.device)
+        self.logger = logging.getLogger(__name__)  # Add logger initialization
         
-        # Training tracking
+        # Use learning rate from config
+        learning_rate = learning_rate or self.config['training']['learning_rate']
+        self.optimizer = Adam(model.parameters(), lr=learning_rate)
+        
+        self.criterion = CrossEntropyLoss(ignore_index=0)  # ignore PAD token
+        self.tokenizer = CaptionTokenizer.from_file('vocab.json')
+        
+        # Verify dimensions
+        assert self.tokenizer.get_vocab_size() == self.model.vocab_size, \
+            f"Tokenizer vocab size ({self.tokenizer.get_vocab_size()}) != Model vocab size ({self.model.vocab_size})"
+        
+        # Initialize tracking variables
         self.train_losses = []
         self.val_losses = []
         self.current_epoch = 0
         
-        self.config = config
-        
+        # Initialize example indices for validation logging
+        self.example_indices = list(range(min(5, vocab_size)))  # Log first 5 examples
+
     def create_masks(self, src, tgt):
-        """
-        Create source and target masks for transformer.
+        """Create masks for transformer input"""
+        batch_size = src.size(0)
         
-        Args:
-            src: Source sequence (image features)
-            tgt: Target sequence (captions)
-            
-        Returns:
-            src_mask: Mask for source sequence
-            tgt_mask: Mask for target sequence (prevents attending to future tokens)
-        """
-        # Source mask (None for image features as we want to attend to all patches)
-        src_mask = None
+        # Handle 4D input by removing singleton dimension if needed
+        if src.dim() == 4:
+            src = src.squeeze(1)  # Remove singleton dimension
         
-        # Target mask (prevents attending to future tokens)
-        tgt_len = tgt.size(1)
-        tgt_mask = torch.triu(torch.ones(tgt_len, tgt_len), diagonal=1).bool()
+        # Create source mask (all ones since we want to attend to all patches)
+        src_seq_len = src.size(1)
+        src_mask = torch.ones((batch_size, 1, 1, src_seq_len), device=self.device)
+        
+        # Create target mask (causal/triangular mask)
+        tgt_seq_len = tgt.size(-1)
+        tgt_mask = torch.triu(torch.ones((tgt_seq_len, tgt_seq_len)), diagonal=1).bool()
+        tgt_mask = ~tgt_mask.unsqueeze(0).unsqueeze(0)  # Add batch and head dims
         tgt_mask = tgt_mask.to(self.device)
         
-        return src_mask, tgt_mask 
+        return src_mask, tgt_mask
 
     def setup_wandb(self, project_name="image-captioning-transformer"):
         """
@@ -80,69 +89,66 @@ class TransformerTrainer:
         )
 
     def train_epoch(self, train_loader):
-        """Modified to handle tokenized captions"""
         self.model.train()
         total_loss = 0
-        num_batches = len(train_loader)
-        logger = logging.getLogger(__name__)
         
-        progress_bar = tqdm(train_loader, desc=f'Epoch {self.current_epoch}')
-        
-        for batch_idx, batch in enumerate(progress_bar):
-            # Get image features and tokenized captions
+        for batch_idx, batch in enumerate(train_loader):
+            # Get data with correct keys
             image_features = batch['image_embeddings'].to(self.device)
-            captions = batch['captions'].to(self.device)  # Now contains encoded captions
+            captions = batch['captions'].to(self.device)
             
-            # Create masks
-            src_mask, tgt_mask = self.create_masks(image_features, captions[:, :-1])
+            # Create target mask of correct size
+            seq_len = captions.size(-1)
+            tgt_mask = torch.ones(seq_len, seq_len, device=self.device)
+            tgt_mask = torch.triu(tgt_mask, diagonal=1).bool()
+            tgt_mask = ~tgt_mask
             
             # Forward pass
-            self.optimizer.zero_grad()
-            output = self.model(
+            outputs = self.model(
                 src=image_features,
-                tgt=captions[:, :-1],  # Input tokens (exclude last)
-                src_mask=src_mask,
+                tgt=captions,
                 tgt_mask=tgt_mask
             )
             
-            # Calculate loss (reshape for CrossEntropyLoss)
-            loss = self.criterion(
-                output.reshape(-1, self.tokenizer.get_vocab_size()),
-                captions[:, 1:].reshape(-1)  # Target tokens (exclude first)
-            )
+            # Reshape outputs and targets for loss calculation
+            B, num_caps, seq_len, vocab_size = outputs.shape
+            outputs = outputs.reshape(-1, vocab_size)  # Combine batch and caption dimensions
+            targets = captions.reshape(-1)  # Flatten targets to match
+            
+            # Calculate loss
+            loss = self.criterion(outputs, targets)
             
             # Backward pass
             loss.backward()
             self.optimizer.step()
+            self.optimizer.zero_grad()
             
-            # Update metrics
             total_loss += loss.item()
-            
-            # Log example predictions periodically
-            if batch_idx % 100 == 0:
-                self._log_example_predictions(output[0], captions[0], batch_idx)
-            
-            # Update progress bar
-            progress_bar.set_postfix({'loss': loss.item()})
-            
-            # Log to W&B
-            wandb.log({
-                "batch_loss": loss.item(),
-                "epoch": self.current_epoch,
-                "batch": batch_idx
-            })
         
-        avg_loss = total_loss / num_batches
-        return avg_loss
+        return total_loss / len(train_loader)
 
     def _log_example_predictions(self, output, target, batch_idx):
-        """Log example predictions for monitoring"""
-        # Get predicted caption
-        pred_tokens = output.argmax(dim=-1)
-        pred_caption = self.tokenizer.decode(pred_tokens)
+        """
+        Log example predictions for monitoring.
         
-        # Get target caption
-        target_caption = self.tokenizer.decode(target)
+        Args:
+            output: Model output tensor (B*num_caps*seq_len, vocab_size) or (B*num_caps, seq_len, vocab_size)
+            target: Target tensor (B, num_caps, seq_len)
+            batch_idx: Current batch index
+        """
+        # Get first example from batch
+        if output.dim() == 2:
+            # Reshape if flattened
+            B = output.size(0) // (target.size(1) * target.size(2))
+            output = output.reshape(B, target.size(1), target.size(2), -1)
+        
+        # Take first caption from first example
+        pred_tokens = output[0, 0].argmax(dim=-1)  # (seq_len,)
+        target_tokens = target[0, 0]  # (seq_len,)
+        
+        # Decode to text
+        pred_caption = self.tokenizer.decode(pred_tokens.tolist(), skip_special_tokens=True)
+        target_caption = self.tokenizer.decode(target_tokens.tolist(), skip_special_tokens=True)
         
         # Log to wandb
         wandb.log({
@@ -153,122 +159,82 @@ class TransformerTrainer:
         })
 
     def validate(self, val_loader):
-        """
-        Validate the model with comprehensive caption quality metrics.
-        """
+        """Validate the model on the validation set"""
         self.model.eval()
         total_loss = 0
-        num_batches = len(val_loader)
-        logger = logging.getLogger(__name__)
-        
-        # Metrics tracking
-        bleu_scores = []
-        meteor_scores = []
-        cider_scores = []
-        spice_scores = []
-        
-        # Initialize scorers
-        cider_scorer = Cider()
-        spice_scorer = Spice()
-        
-        # For CIDEr and SPICE evaluation
-        all_gts = defaultdict(list)
-        all_res = defaultdict(list)
+        all_predictions = []
+        all_targets = []
         
         with torch.no_grad():
-            progress_bar = tqdm(val_loader, desc=f'Validation')
-            
-            for batch_idx, batch in enumerate(progress_bar):
-                # Get image features and captions
+            for batch_idx, batch in enumerate(val_loader):
+                # Get data
                 image_features = batch['image_embeddings'].to(self.device)
                 captions = batch['captions'].to(self.device)
-                
-                # Create masks
-                src_mask, tgt_mask = self.create_masks(image_features, captions[:, :-1])
                 
                 # Forward pass
                 output = self.model(
                     src=image_features,
-                    tgt=captions[:, :-1],
-                    src_mask=src_mask,
-                    tgt_mask=tgt_mask
+                    tgt=captions,
+                    tgt_mask=self.create_masks(image_features, captions)[1]
                 )
                 
                 # Calculate loss
-                loss = self.criterion(
-                    output.reshape(-1, self.tokenizer.get_vocab_size()),
-                    captions[:, 1:].reshape(-1)
-                )
-                
+                B, num_caps, seq_len, vocab_size = output.shape
+                output = output.reshape(-1, vocab_size)
+                targets = captions.reshape(-1)
+                loss = self.criterion(output, targets)
                 total_loss += loss.item()
                 
-                # Calculate caption quality metrics
+                # Get predictions for logging
                 pred_captions = self._get_predictions(output)
-                target_captions = [
-                    self.tokenizer.decode(cap, skip_special_tokens=True)
-                    for cap in captions
-                ]
+                target_captions = self._get_predictions(captions)
                 
-                # Store for CIDEr and SPICE calculation
-                for i, (pred, target) in enumerate(zip(pred_captions, target_captions)):
-                    idx = batch_idx * batch.size(0) + i
-                    all_gts[idx] = [target]
-                    all_res[idx] = [pred]
+                # Store predictions and targets
+                for i in range(B):
+                    idx = batch_idx * B + i
+                    if idx < len(self.example_indices):
+                        example_idx = self.example_indices[idx]
+                        all_predictions.append(pred_captions[example_idx])
+                        all_targets.append(target_captions[example_idx])
                 
-                # Update other metrics
-                for pred, target in zip(pred_captions, target_captions):
-                    bleu = sentence_bleu([target.split()], pred.split())
-                    bleu_scores.append(bleu)
-                    
-                    meteor = meteor_score([target.split()], pred.split())
-                    meteor_scores.append(meteor)
-                
-                progress_bar.set_postfix({
-                    'val_loss': loss.item(),
-                    'bleu': np.mean(bleu_scores[-batch.size(0):])
-                })
-            
-            # Calculate CIDEr and SPICE scores
-            cider_score, _ = cider_scorer.compute_score(all_gts, all_res)
-            spice_score, spice_details = spice_scorer.compute_score(all_gts, all_res)
-            
-            # Calculate average metrics
-            avg_loss = total_loss / num_batches
-            avg_bleu = np.mean(bleu_scores)
-            avg_meteor = np.mean(meteor_scores)
-            
-            # Log metrics
-            wandb.log({
-                "val_loss": avg_loss,
-                "val_bleu": avg_bleu,
-                "val_meteor": avg_meteor,
-                "val_cider": float(cider_score),
-                "val_spice": float(spice_score)
-            })
-            
-            logger.info(f"Validation Metrics:")
-            logger.info(f"Loss: {avg_loss:.4f}")
-            logger.info(f"BLEU: {avg_bleu:.4f}")
-            logger.info(f"METEOR: {avg_meteor:.4f}")
-            logger.info(f"CIDEr: {cider_score:.4f}")
-            logger.info(f"SPICE: {spice_score:.4f}")
-            
-            return avg_loss
+                # Log example predictions
+                if batch_idx == 0:
+                    self._log_example_predictions(output, captions, batch_idx)
+        
+        # Log validation metrics
+        avg_loss = total_loss / len(val_loader)
+        self.val_losses.append(avg_loss)
+        
+        return avg_loss
 
     def _get_predictions(self, output):
         """
         Convert model output to caption predictions.
+        
+        Args:
+            output: Model output tensor (batch_size * num_caps, seq_len, vocab_size)
+                    or (batch_size * num_caps * seq_len, vocab_size)
         """
+        # Ensure output is 3D
+        if output.dim() == 2:
+            B = output.size(0) // 50  # Assuming seq_len=50
+            output = output.reshape(B, 50, -1)
+        
         # Get most likely tokens
-        pred_tokens = output.argmax(dim=-1)
+        pred_tokens = output.argmax(dim=-1)  # (batch_size * num_caps, seq_len)
         
         # Convert to captions
-        pred_captions = [
-            self.tokenizer.decode(tokens, skip_special_tokens=True)
-            for tokens in pred_tokens
-        ]
+        pred_captions = []
+        for tokens in pred_tokens:
+            caption = self.tokenizer.decode(tokens.tolist(), skip_special_tokens=True)
+            pred_captions.append(caption)
         
         return pred_captions
+
+    def create_target_mask(self, size):
+        """Create mask for decoder self-attention"""
+        mask = torch.triu(torch.ones(size, size), diagonal=1).bool()
+        return mask
 
     def train(self, train_loader, val_loader, num_epochs, batch_size):
         """
@@ -361,73 +327,48 @@ def setup_logging(log_dir="logs"):
     return logging.getLogger(__name__)
 
 def main():
-    """
-    Main function to set up and run the training process.
-    """
+    """Main training function"""
     # Load configuration
     config = load_config('config.yaml')
     
+    # Set up logging
+    logger = setup_logging(config['logging']['log_dir'])
+    logger.info("Starting training setup...")
+    
+    # Set device
+    device = torch.device(config['training']['device'] 
+                        if torch.cuda.is_available() else 'cpu')
+    logger.info(f"Using device: {device}")
+    
     try:
-        # Set up logging
-        logger = setup_logging(config['logging']['log_dir'])
-        logger.info("Starting training setup...")
-        
-        # Set device
-        device = torch.device(config['training']['device'] 
-                            if torch.cuda.is_available() else 'cpu')
-        logger.info(f"Using device: {device}")
-        
         # Create dataloaders
-        try:
-            logger.info("Creating dataloaders...")
-            dataloaders = create_dataloaders(config)
-            train_loader = dataloaders['train']
-            val_loader = dataloaders['val']
-            logger.info(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
-        except Exception as e:
-            logger.error(f"Failed to create dataloaders: {str(e)}")
-            raise
+        logger.info("Creating dataloaders...")
+        dataloaders = create_dataloaders(config)
         
         # Initialize model
-        try:
-            logger.info("Initializing model...")
-            model = Transformer(config)
-            logger.info("Model initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize model: {str(e)}")
-            raise
+        logger.info("Initializing model...")
+        model = Transformer(config)
         
         # Initialize trainer
-        try:
-            logger.info("Setting up trainer...")
-            trainer = TransformerTrainer(
-                model=model,
-                vocab_size=config['model']['vocab_size'],
-                learning_rate=config['training']['learning_rate'],
-                device=device,
-                config=config
-            )
-            logger.info("Trainer initialized successfully")
-        except Exception as e:
-            logger.error(f"Failed to initialize trainer: {str(e)}")
-            raise
+        logger.info("Setting up trainer...")
+        trainer = TransformerTrainer(
+            model=model,
+            vocab_size=config['model']['vocab_size'],
+            device=device,
+            config=config
+        )
         
         # Start training
         logger.info("Starting training process...")
-        try:
-            trainer.train(
-                train_loader=train_loader,
-                val_loader=val_loader,
-                num_epochs=config['training']['num_epochs'],
-                batch_size=config['training']['batch_size']
-            )
-            logger.info("Training completed successfully")
-        except Exception as e:
-            logger.error(f"Training failed: {str(e)}")
-            raise
-            
+        trainer.train(
+            train_loader=dataloaders['train'],
+            val_loader=dataloaders['val'],
+            num_epochs=config['training']['num_epochs'],
+            batch_size=config['training']['batch_size']
+        )
+        
     except Exception as e:
-        logger.error(f"Training setup failed: {str(e)}")
+        logger.error(f"Training failed: {str(e)}")
         raise
     finally:
         logger.info("Training process ended")

@@ -16,6 +16,9 @@ class ImagePreprocessor:
     """Handles image preprocessing including resizing and patching."""
     
     def __init__(self, config):
+        # Validate config first
+        self.validate_config(config)
+        
         self.img_size = config['image']['img_size']
         self.patch_size = config['image']['patch_size']
         self.n_patches = (self.img_size // self.patch_size) ** 2
@@ -31,6 +34,13 @@ class ImagePreprocessor:
         # Linear projection of flattened patches
         patch_dim = config['image']['num_channels'] * self.patch_size * self.patch_size
         self.patch_embedding = nn.Linear(patch_dim, config['model']['d_model'])
+
+    def validate_config(self, config):
+        """Validate configuration parameters"""
+        required_keys = ['image', 'model', 'training', 'data']
+        for key in required_keys:
+            if key not in config:
+                raise ValueError(f"Missing required config section: {key}")
 
     def extract_patches(self, image_tensor):
         """
@@ -156,11 +166,26 @@ class Flickr30kDataset(Dataset):
         self.config = config or load_config('config.yaml')
         print(f"Loading {split} split from {self.config['data']['dataset_name']}")
         
-        # Load only a small subset for testing
-        self.dataset = load_dataset(
+        # First load the test split, then apply our split percentages
+        full_dataset = load_dataset(
             self.config['data']['dataset_name'],
-            split=f"{split}[:1000]"  # Load only first 1000 examples
+            split="test"
         )
+        
+        # Calculate indices for our splits (based on 1000 examples)
+        total_size = min(len(full_dataset), 1000)
+        if "test[:80%]" in split:
+            start_idx = 0
+            end_idx = int(0.8 * total_size)
+        elif "test[80%:90%]" in split:
+            start_idx = int(0.8 * total_size)
+            end_idx = int(0.9 * total_size)
+        else:  # test[90%:]
+            start_idx = int(0.9 * total_size)
+            end_idx = total_size
+        
+        # Select our portion
+        self.dataset = full_dataset.select(range(start_idx, end_idx))
         print(f"Loaded {len(self.dataset)} examples")
         
         self.image_processor = ImagePreprocessor(self.config)
@@ -169,7 +194,7 @@ class Flickr30kDataset(Dataset):
         # Initialize tokenizer
         self.tokenizer = CaptionTokenizer(vocab_size=self.config['model']['vocab_size'])
         
-        if split == self.config['data']['train_split']:
+        if "test[" not in split or split == "test[:80%]":  # Build vocab for training portion
             self._build_vocabulary()
         else:
             try:
@@ -210,6 +235,11 @@ class Flickr30kDataset(Dataset):
         # Plot distributions
         self.tokenizer.plot_word_frequency_distribution()
         self.tokenizer.plot_word_length_distribution()
+        
+        # After building vocabulary, update config
+        actual_vocab_size = self.tokenizer.get_vocab_size()
+        self.config['model']['vocab_size'] = actual_vocab_size
+        print(f"Updated config vocab_size to {actual_vocab_size}")
     
     def __len__(self):
         return len(self.dataset)
@@ -254,15 +284,15 @@ def create_dataloaders(config=None):
     
     # Create datasets for each split
     train_dataset = Flickr30kDataset(
-        split=config['data']['train_split'],
+        split="test[:80%]",  # Use first 80% for training
         config=config
     )
     val_dataset = Flickr30kDataset(
-        split=config['data']['val_split'],
+        split="test[80%:90%]",  # Use next 10% for validation
         config=config
     )
     test_dataset = Flickr30kDataset(
-        split=config['data']['test_split'],
+        split="test[90%:]",  # Use last 10% for testing
         config=config
     )
     

@@ -1,0 +1,18 @@
+[
+    {
+        "image": "image1.jpg",
+        "caption": "a person is walking with a dog in the park"
+    },
+    {
+        "image": "image2.jpg",
+        "caption": "a woman is sitting on a bench"
+    },
+    {
+        "image": "image3.jpg",
+        "caption": "the man is playing with a cat"
+    },
+    {
+        "image": "image4.jpg",
+        "caption": "a dog is running on the beach"
+    }
+] 

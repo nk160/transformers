@@ -6,13 +6,17 @@ from pathlib import Path
 import re
 import matplotlib.pyplot as plt
 import seaborn as sns
+from utils.config import load_config
 
 class CaptionTokenizer:
     """
     Tokenizer for image captions.
     Handles conversion between text and token ids.
     """
-    def __init__(self, vocab_size: int = 10000):
+    def __init__(self, vocab_size: int = None, config_path: str = 'config.yaml'):
+        if vocab_size is None:
+            config = load_config(config_path)
+            vocab_size = config['model']['vocab_size']
         self.vocab_size = vocab_size
         
         # Special tokens
@@ -88,26 +92,36 @@ class CaptionTokenizer:
         
         return torch.tensor(tokens)
     
-    def decode(self, tokens: torch.Tensor, skip_special_tokens: bool = True) -> str:
+    def decode(self, tokens, skip_special_tokens=True):
         """
-        Convert token ids back to a caption string.
+        Decode token ids back to text.
         
         Args:
-            tokens: Tensor of token ids
-            skip_special_tokens: Whether to remove special tokens from output
-        
-        Returns:
-            Caption string
+            tokens: Token ids (int, list, or tensor)
+            skip_special_tokens: Whether to skip special tokens in output
         """
+        if torch.is_tensor(tokens):
+            if tokens.dim() > 1:
+                # Get predicted tokens (highest probability)
+                tokens = tokens.argmax(dim=-1) if tokens.dim() > 1 else tokens
+            tokens = tokens.tolist()  # Convert to list
+        elif not isinstance(tokens, (list, tuple)):
+            tokens = [tokens]
+        
+        # Convert tokens to words
         words = []
         for token in tokens:
-            idx = token.item() if torch.is_tensor(token) else token
+            if isinstance(token, torch.Tensor):
+                idx = token.item()
+            else:
+                idx = token
             
             # Skip special tokens if requested
-            if skip_special_tokens and idx in self.special_tokens:
+            if skip_special_tokens and idx in [self.PAD_token, self.END_token, self.START_token]:
                 continue
-                
-            words.append(self.idx2word.get(idx, self.special_tokens[self.UNK_token]))
+            
+            word = self.idx2word.get(idx, self.special_tokens[self.UNK_token])
+            words.append(word)
         
         return ' '.join(words)
     
